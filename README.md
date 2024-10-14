@@ -44,3 +44,7 @@ This project aims to detect phishing websites using machine learning models and 
     * Removing top few attributes and comparing new accuracy results with the old ones.
   * Robustness Check:
     * Introduction of noise to the model to check its impact on the model.
+  * SHAP:
+    *  Game theoretic approach to explain the output of any machine learning model.
+    *  How features with high importance impacts the prediction of models.
+    *  How models perform without this features. 
