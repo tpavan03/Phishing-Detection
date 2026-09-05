@@ -1,0 +1,8 @@
+{
+  "name": "phishscope-browser-checks",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Optional browser validation for the dependency-free PhishScope application",
+  "scripts": {"test:e2e": "node tests/browser.cjs"},
+  "devDependencies": {"playwright": "1.63.0"}
+}

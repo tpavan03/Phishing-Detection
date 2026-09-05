@@ -1,0 +1,14 @@
+services:
+  phishscope:
+    build: .
+    ports:
+      - "127.0.0.1:3102:3102"
+    volumes:
+      - phishscope-data:/data
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+volumes:
+  phishscope-data:

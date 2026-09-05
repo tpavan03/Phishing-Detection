@@ -1,0 +1,7 @@
+.git
+*.ipynb
+docs
+tests
+data
+__pycache__
+node_modules
