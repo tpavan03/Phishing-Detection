@@ -1,4 +1,5 @@
 import json
+import base64
 import tempfile
 import threading
 import unittest
@@ -8,6 +9,7 @@ from urllib.request import Request, urlopen
 from unittest.mock import patch
 from http.server import ThreadingHTTPServer
 from app.workflow import analyze, normalize
+from app.reputation import ProviderError
 from app import server
 
 class WorkflowTests(unittest.TestCase):
@@ -35,6 +37,35 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(high['stages'][-1]['status'],'waiting')
         self.assertEqual(analyze('https://paypal.com/login')['risk'],'low')
         self.assertTrue(any(e['id']=='host.brand.paypal' for e in analyze('https://paypal.com.evil.example/login')['evidence']))
+
+    def test_optional_agents_use_fixed_endpoints_and_unified_policy(self):
+        requests=[]
+        def transport(request):
+            requests.append(request)
+            if '/urls/' in request.full_url:
+                return {'data':{'attributes':{'last_analysis_stats':{'malicious':2,'suspicious':1,'harmless':20,'undetected':5}}}}
+            if '/domains/' in request.full_url:
+                return {'data':{'attributes':{'last_analysis_stats':{'malicious':0,'suspicious':0,'harmless':30,'undetected':2},'reputation':3}}}
+            return {'matches':[]}
+        secret='request-secret'; key='vt-secret'; google='gsb-secret'
+        result=analyze('https://example.com/login?token='+secret, {'virustotal':key,'google_safe_browsing':google}, transport)
+        self.assertEqual(result['unified_decision']['label'],'likely_malicious')
+        self.assertTrue(result['review_required'])
+        serialized=json.dumps(result)
+        for value in (secret,key,google):self.assertNotIn(value,serialized)
+        self.assertEqual(len(requests),3)
+        expected=base64.urlsafe_b64encode(('https://example.com/login?token='+secret).encode()).decode().rstrip('=')
+        self.assertEqual(requests[0].full_url,'https://www.virustotal.com/api/v3/urls/'+expected)
+        self.assertEqual(requests[0].get_header('X-apikey'),key)
+        self.assertEqual(requests[1].full_url,'https://www.virustotal.com/api/v3/domains/example.com')
+        self.assertTrue(requests[2].full_url.startswith('https://safebrowsing.googleapis.com/v4/threatMatches:find?'))
+
+    def test_provider_failure_keeps_offline_result(self):
+        def unavailable(_request):raise ProviderError('Provider timed out; offline analysis is still available.')
+        result=analyze('https://example.com', {'virustotal':'key'}, unavailable)
+        self.assertEqual(result['score'],0)
+        self.assertEqual(result['unified_decision']['label'],'low_concern')
+        self.assertTrue(all(item['status']=='unavailable' for item in result['provider_results']))
 
 class ApiTests(unittest.TestCase):
     @classmethod
@@ -66,7 +97,9 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.req('/api/analyze',{'url':'http://127.0.0.1'})[0],400)
         self.assertEqual(self.req('/api/analyze',[])[0],400)
         self.assertEqual(self.req('/api/analyze',{'url':'example.com'}, {'Content-Type':'application/json','Origin':'https://evil.example'})[0],403)
-        self.assertEqual(self.req('/api/analyze',{'url':'a'*9000})[0],413)
+        self.assertEqual(self.req('/api/analyze',{'url':'a'*17000})[0],413)
+        self.assertEqual(self.req('/api/analyze',{'url':'example.com','providers':[]})[0],400)
+        self.assertEqual(self.req('/api/analyze',{'url':'example.com','providers':{'virustotal':'bad key'}})[0],400)
         self.assertEqual(self.req('/api/analyze',{'url':'example.com'},{'Content-Type':'text/plain'})[0],415)
         self.assertEqual(self.req('/api/cases/missing')[0],404)
         self.assertEqual(self.req('/../README.md')[0],404)
@@ -78,9 +111,21 @@ class ApiTests(unittest.TestCase):
         status,result=self.req(p,{'decision':'needs_investigation','note':'Need sender context.'})
         self.assertEqual(status,200);self.assertEqual(result['status'],'escalated')
     def test_health_and_security_headers(self):
-        self.assertEqual(self.req('/api/health')[1]['mode'],'offline rules')
+        self.assertEqual(self.req('/api/health')[1]['mode'],'local rules + optional reputation')
         with urlopen(self.base) as r:
             self.assertIn("frame-ancestors 'none'",r.headers['Content-Security-Policy'])
             self.assertEqual(r.headers['X-Content-Type-Options'],'nosniff')
+
+    def test_provider_keys_are_never_persisted(self):
+        def transport(request):
+            if '/domains/' in request.full_url:
+                return {'data':{'attributes':{'last_analysis_stats':{},'reputation':0}}}
+            return {'data':{'attributes':{'last_analysis_stats':{}}}}
+        with patch('app.server.analyze', side_effect=lambda raw, credentials: analyze(raw,credentials,transport)):
+            status,case=self.req('/api/analyze',{'url':'https://example.com/?token=request-secret','providers':{'virustotal':'never-save-this-key'}})
+        self.assertEqual(status,201)
+        saved=json.dumps(self.req('/api/cases/'+case['id'])[1])
+        self.assertNotIn('never-save-this-key',saved)
+        self.assertNotIn('request-secret',saved)
 
 if __name__=='__main__':unittest.main()

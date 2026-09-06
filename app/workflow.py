@@ -1,14 +1,16 @@
-"""Offline, tool-selecting URL triage. No DNS, network requests, or model weights."""
+"""URL triage with offline rules and explicitly enabled reputation agents."""
 import ipaddress
 import re
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, unquote
+from app.reputation import run_agents
 
-VERSION = '1.0.0'
+VERSION = '2.1.0'
 LIMITATIONS = [
-    'Offline lexical heuristics; this is not the trained model from the research notebooks.',
-    'No DNS, website content, redirects, reputation feeds, or certificate verification are performed.',
+    'The local scorer is deterministic lexical logic, not the trained model from the research notebooks.',
+    'Submitted websites are never fetched. DNS, content, redirects, and certificates are not inspected.',
+    'Optional reputation providers return third-party observations, which may be stale, incomplete, or unavailable.',
     'The score is a transparent rule total, not a probability. Low concern does not establish safety.',
 ]
 
@@ -60,8 +62,38 @@ def normalize(raw):
             'original_length': len(raw), 'has_fragment': bool(parts.fragment)}
 
 
-def analyze(raw):
+def _lookup_url(raw, target):
+    """Validated URL for opt-in reputation APIs; this value is never returned or persisted."""
+    candidate = raw.strip()
+    if '://' not in candidate:
+        candidate = 'https://' + candidate
+    parts = urlsplit(candidate)
+    saved = urlsplit(target['url'])
+    return urlunsplit((target['scheme'], saved.netloc, parts.path or '/', parts.query, ''))
+
+
+def _unified_decision(score, provider_results):
+    completed = [item for item in provider_results if item['status'] == 'completed']
+    positives = [item['agent'] for item in completed if item.get('malicious')]
+    if positives:
+        return {'label': 'likely_malicious', 'title': 'Likely malicious',
+                'explanation': 'Threat intelligence flagged this target: ' + ', '.join(positives) + '.'}
+    if score >= 50:
+        return {'label': 'likely_malicious', 'title': 'Likely malicious',
+                'explanation': 'The local deterministic scorer found a high concentration of phishing-like URL signals.'}
+    if score >= 20:
+        return {'label': 'needs_review', 'title': 'Needs review',
+                'explanation': 'The local scorer found warning signals, but available evidence is not decisive.'}
+    if completed:
+        return {'label': 'likely_benign', 'title': 'Likely benign',
+                'explanation': 'The local score is low and the completed reputation agents returned no malicious match. This is not a safety guarantee.'}
+    return {'label': 'low_concern', 'title': 'Low concern',
+            'explanation': 'Only the deterministic local scorer ran and found few lexical warning signals; no reputation verdict is available.'}
+
+
+def analyze(raw, credentials=None, reputation_transport=None):
     target = normalize(raw)
+    lookup_url = _lookup_url(raw, target)
     findings = []
     def evidence(code, title, detail, weight):
         findings.append({'id': code, 'title': title, 'detail': detail, 'weight': weight,
@@ -73,8 +105,8 @@ def analyze(raw):
     if 'xn--' in target['host']:
         plan.append('internationalized_hostname')
     stage = lambda name, detail: {'name': name, 'status': 'completed', 'detail': detail}
-    stages = [stage('Intake', 'Validated syntax and rejected explicit local/private targets. No network access.'),
-              stage('Plan', 'Selected tools from URL features: ' + ', '.join(plan) + '.')]
+    stages = [stage('Intake', 'Validated syntax and rejected explicit local/private targets. The submitted website is never fetched.'),
+              stage('Plan', 'Selected local tools from URL features: ' + ', '.join(plan) + '. Reputation agents run only when keys are supplied.')]
     if target['scheme'] == 'http':
         evidence('transport.http', 'Unencrypted URL scheme', 'HTTP does not provide transport encryption. This alone does not establish phishing.', 15)
     else:
@@ -113,12 +145,28 @@ def analyze(raw):
     score = min(100, sum(x['weight'] for x in findings))
     level = 'high' if score >= 50 else 'moderate' if score >= 20 else 'low'
     required = level != 'low'
-    stages += [stage('Investigate', f'Executed {len(plan)} offline tools; collected {len(findings)} evidence items.'),
-               stage('Evaluate', f'Rule total {score}/100 → {level} concern. Thresholds: moderate ≥20; high ≥50.'),
+    credentials = credentials or {}
+    providers = run_agents(lookup_url, host, credentials, reputation_transport) if reputation_transport else run_agents(lookup_url, host, credentials)
+    for item in providers:
+        findings.append({'id': 'provider.' + item['agent'].lower().replace(' ', '_'), 'title': item['agent'],
+                         'detail': item['summary'], 'weight': 0,
+                         'severity': 'high' if item.get('malicious') else ('info' if item['status'] == 'completed' else 'medium'),
+                         'source': 'external_reputation', 'status': item['status']})
+    unified = _unified_decision(score, providers)
+    if unified['label'] == 'likely_malicious':
+        level = 'high'
+        required = True
+    elif unified['label'] == 'needs_review':
+        level = 'moderate'
+        required = True
+    agent_count = len(plan) + len(providers)
+    stages += [stage('Investigate', f'Executed {len(plan)} local tools and {len(providers)} optional reputation agents; collected {len(findings)} evidence items.'),
+               stage('Evaluate', f'Unified decision: {unified["title"]}. Local rule total {score}/100; provider results are separate signals.'),
                {'name': 'Human review', 'status': 'waiting' if required else 'optional',
                 'detail': 'A person must assess context before resolving this case.' if required else 'Optional review; limited lexical evidence cannot establish safety.'}]
     return {'id': str(uuid.uuid4()), 'created_at': datetime.now(timezone.utc).isoformat(),
-            'url': target['url'], 'host': host, 'mode': 'offline rules', 'workflow_version': VERSION,
+            'url': target['url'], 'host': host, 'mode': 'local rules + optional reputation', 'workflow_version': VERSION,
             'score': score, 'risk': level, 'review_required': required,
             'status': 'awaiting_review' if required else 'analysis_complete', 'review': None,
-            'tools': plan, 'stages': stages, 'evidence': findings, 'limitations': LIMITATIONS}
+            'tools': plan, 'agent_count': agent_count, 'provider_results': providers,
+            'unified_decision': unified, 'stages': stages, 'evidence': findings, 'limitations': LIMITATIONS}

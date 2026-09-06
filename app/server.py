@@ -36,7 +36,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == '/api/health':
-            return self.reply(200, {'status': 'ok', 'mode': 'offline rules', 'version': VERSION})
+            return self.reply(200, {'status': 'ok', 'mode': 'local rules + optional reputation', 'version': VERSION})
         if path == '/api/cases':
             with connect() as db:
                 rows = db.execute('SELECT payload FROM cases ORDER BY created_at DESC LIMIT 30').fetchall()
@@ -45,7 +45,7 @@ class Handler(BaseHTTPRequestHandler):
             with connect() as db:
                 row = db.execute('SELECT payload FROM cases WHERE id=?', (path.rsplit('/', 1)[-1],)).fetchone()
             return self.reply(200, json.loads(row[0])) if row else self.reply(404, {'error': 'Case not found.'})
-        files = {'/': ('index.html', 'text/html; charset=utf-8'), '/styles.css': ('styles.css', 'text/css; charset=utf-8'), '/app.js': ('app.js', 'text/javascript; charset=utf-8')}
+        files = {'/': ('index.html', 'text/html; charset=utf-8'), '/styles.css': ('styles.css', 'text/css; charset=utf-8'), '/agents.css': ('agents.css', 'text/css; charset=utf-8'), '/app.js': ('app.js', 'text/javascript; charset=utf-8')}
         if path in files:
             name, mime = files[path]
             return self.reply(200, (STATIC / name).read_bytes(), mime)
@@ -58,8 +58,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(403, {'error': 'Cross-origin requests are not permitted.'})
         try:
             length = int(self.headers.get('Content-Length', '0'))
-            if length < 1 or length > 8192:
-                return self.reply(413, {'error': 'Request must be between 1 and 8,192 bytes.'})
+            if length < 1 or length > 16384:
+                return self.reply(413, {'error': 'Request must be between 1 and 16,384 bytes.'})
             if self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
                 return self.reply(415, {'error': 'Use application/json.'})
             data = json.loads(self.rfile.read(length))
@@ -67,7 +67,17 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError('Expected a JSON object.')
             path = urlsplit(self.path).path
             if path == '/api/analyze':
-                result = analyze(data.get('url'))
+                supplied = data.get('providers', {})
+                if not isinstance(supplied, dict):
+                    raise ValueError('Provider credentials must be an object.')
+                credentials = {}
+                for name in ('virustotal', 'google_safe_browsing'):
+                    key = supplied.get(name, '')
+                    if not isinstance(key, str) or len(key) > 512 or any(ord(char) < 33 or ord(char) == 127 for char in key):
+                        raise ValueError('API keys must be at most 512 characters without whitespace or controls.')
+                    if key:
+                        credentials[name] = key
+                result = analyze(data.get('url'), credentials)
                 with connect() as db:
                     db.execute('INSERT INTO cases VALUES (?, ?, ?)', (result['id'], result['created_at'], json.dumps(result)))
                 return self.reply(201, result)
